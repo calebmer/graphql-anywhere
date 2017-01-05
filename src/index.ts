@@ -60,6 +60,7 @@ export type ExecInfo = {
 export type ExecOptions = {
   resultMapper?: ResultMapper;
   fragmentMatcher?: FragmentMatcher;
+  previousResult?: any;
 }
 
 // Based on graphql function from graphql-js:
@@ -84,10 +85,12 @@ export default function graphql(
   const fragments = getFragmentDefinitions(document);
   const fragmentMap = createFragmentMap(fragments) || {};
 
-  const resultMapper = execOptions.resultMapper;
-
-  // Default matcher always matches all fragments
-  const fragmentMatcher = execOptions.fragmentMatcher || (() => true);
+  const {
+    resultMapper,
+    // Default matcher always matches all fragments
+    fragmentMatcher = () => true,
+    previousResult = null,
+  } = execOptions;
 
   const execContext: ExecContext = {
     fragmentMap,
@@ -101,13 +104,15 @@ export default function graphql(
   return executeSelectionSet(
     mainDefinition.selectionSet,
     rootValue,
-    execContext
+    previousResult,
+    execContext,
   );
 }
 
 function executeSelectionSet(
   selectionSet: SelectionSet,
   rootValue: any,
+  previousResult: any,
   execContext: ExecContext
 ) {
   const {
@@ -115,6 +120,11 @@ function executeSelectionSet(
     contextValue,
     variableValues: variables,
   } = execContext;
+
+  // If we `previousResult` is nullish then we know beforehand that the result has been modified
+  // without needing to look at our selections. If we have an object for `previousResult` then we
+  // have yet to tell if it has been changed.
+  let resultModified = previousResult == null;
 
   const result = {};
 
@@ -128,10 +138,15 @@ function executeSelectionSet(
       const fieldResult = executeField(
         selection,
         rootValue,
-        execContext
+        previousResult,
+        execContext,
       );
 
       const resultFieldKey = resultKeyNameFromField(selection);
+
+      if (previousResult && fieldResult !== previousResult[resultFieldKey]) {
+        resultModified = true;
+      }
 
       if (fieldResult !== undefined) {
         result[resultFieldKey] = fieldResult;
@@ -156,8 +171,13 @@ function executeSelectionSet(
         const fragmentResult = executeSelectionSet(
           fragment.selectionSet,
           rootValue,
-          execContext
+          previousResult,
+          execContext,
         );
+
+        if (fragmentResult !== previousResult) {
+          resultModified = true;
+        }
 
         merge(result, fragmentResult);
       }
@@ -168,13 +188,16 @@ function executeSelectionSet(
     return execContext.resultMapper(result, rootValue);
   }
 
-  return result;
+  // If the result was not modified this entire time, just return the previous result so we may
+  // maintain referential equality.
+  return resultModified ? result : previousResult;
 }
 
 function executeField(
   field: Field,
   rootValue: any,
-  execContext: ExecContext
+  previousResult: any,
+  execContext: ExecContext,
 ): any {
   const {
     variableValues: variables,
@@ -184,10 +207,11 @@ function executeField(
 
   const fieldName = field.name.value;
   const args = argumentsObjectFromField(field, variables);
+  const resultKey = resultKeyNameFromField(field);
 
   const info: ExecInfo = {
     isLeaf: ! field.selectionSet,
-    resultKey: resultKeyNameFromField(field),
+    resultKey,
   };
 
   const result = resolver(fieldName, rootValue, args, contextValue, info);
@@ -205,23 +229,32 @@ function executeField(
   }
 
   if (Array.isArray(result)) {
-    return executeSubSelectedArray(field, result, execContext);
+    return executeSubSelectedArray(
+      field,
+      result,
+      previousResult ? previousResult[resultKey] : null,
+      execContext,
+    );
   }
 
   // Returned value is an object, and the query has a sub-selection. Recurse.
   return executeSelectionSet(
     field.selectionSet,
     result,
-    execContext
+    previousResult ? previousResult[resultKey] : null,
+    execContext,
   );
 }
 
 function executeSubSelectedArray(
   field,
   result,
-  execContext
+  previousResult,
+  execContext,
 ) {
-  return result.map((item) => {
+  let resultModified = previousResult == null;
+
+  const nextResult = result.map((item, i) => {
     // null value in array
     if (item === null) {
       return null;
@@ -229,16 +262,30 @@ function executeSubSelectedArray(
 
     // This is a nested array, recurse
     if (Array.isArray(item)) {
-      return executeSubSelectedArray(field, item, execContext);
+      return executeSubSelectedArray(
+        field,
+        item,
+        previousResult ? previousResult[i] : null,
+        execContext,
+      );
     }
 
     // This is an object, run the selection set on it
-    return executeSelectionSet(
+    const nextItem = executeSelectionSet(
       field.selectionSet,
       item,
-      execContext
+      previousResult ? previousResult[i] : null,
+      execContext,
     );
+
+    if (previousResult && nextItem !== previousResult[i]) {
+      resultModified = true;
+    }
+
+    return nextItem;
   });
+
+  return resultModified ? nextResult : previousResult;
 }
 
 function merge(dest, src) {
